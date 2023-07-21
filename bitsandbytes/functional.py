@@ -9,6 +9,8 @@ import random
 import torch
 import itertools
 import math
+from scipy.stats import norm
+import numpy as np
 
 from functools import reduce  # Required in Python 3
 from typing import Tuple
@@ -26,64 +28,94 @@ name2qmap = {}
 if COMPILED_WITH_CUDA:
     """C FUNCTIONS FOR OPTIMIZERS"""
     str2optimizer32bit = {}
-    str2optimizer32bit["adam"] = (lib.cadam32bit_g32, lib.cadam32bit_g16)
+    str2optimizer32bit["adam"] = (lib.cadam32bit_grad_fp32, lib.cadam32bit_grad_fp16, lib.cadam32bit_grad_bf16)
     str2optimizer32bit["momentum"] = (
-        lib.cmomentum32bit_g32,
-        lib.cmomentum32bit_g16,
+        lib.cmomentum32bit_grad_32,
+        lib.cmomentum32bit_grad_16,
     )
     str2optimizer32bit["rmsprop"] = (
-        lib.crmsprop32bit_g32,
-        lib.crmsprop32bit_g16,
+        lib.crmsprop32bit_grad_32,
+        lib.crmsprop32bit_grad_16,
     )
+    str2optimizer32bit["lion"] = (lib.clion32bit_grad_fp32, lib.clion32bit_grad_fp16, lib.clion32bit_grad_bf16)
     str2optimizer32bit["adagrad"] = (
-        lib.cadagrad32bit_g32,
-        lib.cadagrad32bit_g16,
+        lib.cadagrad32bit_grad_32,
+        lib.cadagrad32bit_grad_16,
     )
-    str2optimizer32bit["lars"] = (
-        lib.cmomentum32bit_g32,
-        lib.cmomentum32bit_g16,
-    )
-    str2optimizer32bit["lamb"] = (lib.cadam32bit_g32, lib.cadam32bit_g16)
 
     str2optimizer8bit = {}
     str2optimizer8bit["adam"] = (
-        lib.cadam_static_8bit_g32,
-        lib.cadam_static_8bit_g16,
+        lib.cadam_static_8bit_grad_32,
+        lib.cadam_static_8bit_grad_16,
     )
     str2optimizer8bit["momentum"] = (
-        lib.cmomentum_static_8bit_g32,
-        lib.cmomentum_static_8bit_g16,
+        lib.cmomentum_static_8bit_grad_32,
+        lib.cmomentum_static_8bit_grad_16,
     )
     str2optimizer8bit["rmsprop"] = (
-        lib.crmsprop_static_8bit_g32,
-        lib.crmsprop_static_8bit_g16,
+        lib.crmsprop_static_8bit_grad_32,
+        lib.crmsprop_static_8bit_grad_16,
+    )
+    str2optimizer8bit["lion"] = (
+        lib.clion_static_8bit_grad_32,
+        lib.clion_static_8bit_grad_16,
     )
     str2optimizer8bit["lamb"] = (
-        lib.cadam_static_8bit_g32,
-        lib.cadam_static_8bit_g16,
+        lib.cadam_static_8bit_grad_32,
+        lib.cadam_static_8bit_grad_16,
     )
     str2optimizer8bit["lars"] = (
-        lib.cmomentum_static_8bit_g32,
-        lib.cmomentum_static_8bit_g16,
+        lib.cmomentum_static_8bit_grad_32,
+        lib.cmomentum_static_8bit_grad_16,
     )
 
     str2optimizer8bit_blockwise = {}
     str2optimizer8bit_blockwise["adam"] = (
-        lib.cadam_8bit_blockwise_fp32,
-        lib.cadam_8bit_blockwise_fp16,
+        lib.cadam_8bit_blockwise_grad_fp32,
+        lib.cadam_8bit_blockwise_grad_fp16,
+        lib.cadam_8bit_blockwise_grad_bf16,
     )
     str2optimizer8bit_blockwise["momentum"] = (
-        lib.cmomentum_8bit_blockwise_fp32,
-        lib.cmomentum_8bit_blockwise_fp16,
+        lib.cmomentum_8bit_blockwise_grad_fp32,
+        lib.cmomentum_8bit_blockwise_grad_fp16,
     )
     str2optimizer8bit_blockwise["rmsprop"] = (
-        lib.crmsprop_8bit_blockwise_fp32,
-        lib.crmsprop_8bit_blockwise_fp16,
+        lib.crmsprop_8bit_blockwise_grad_fp32,
+        lib.crmsprop_8bit_blockwise_grad_fp16,
+    )
+    str2optimizer8bit_blockwise["lion"] = (
+        lib.clion_8bit_blockwise_grad_fp32,
+        lib.clion_8bit_blockwise_grad_fp16,
+        lib.clion_8bit_blockwise_grad_bf16,
     )
     str2optimizer8bit_blockwise["adagrad"] = (
-        lib.cadagrad_8bit_blockwise_fp32,
-        lib.cadagrad_8bit_blockwise_fp16,
+        lib.cadagrad_8bit_blockwise_grad_fp32,
+        lib.cadagrad_8bit_blockwise_grad_fp16,
     )
+
+class GlobalPageManager:
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self):
+        self.paged_tensors = []
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.initialize()
+        return cls._instance
+
+    def prefetch_all(self, to_cpu=False):
+        # assume the first added, will be hte
+        # ones that are used first, so swap them in last
+        # in the case they are evicted again
+        for t in self.paged_tensors[::-1]:
+            prefetch_tensor(t, to_cpu)
+
 
 
 class CUBLAS_Context:
@@ -94,11 +126,6 @@ class CUBLAS_Context:
 
     def initialize(self):
         self.context = {}
-        # prev_device = torch.cuda.current_device()
-        # for i in range(torch.cuda.device_count()):
-        #    torch.cuda.set_device(torch.device('cuda', i))
-        #    self.context.append(ct.c_void_p(lib.get_context()))
-        # torch.cuda.set_device(prev_device)
 
     @classmethod
     def get_instance(cls):
@@ -132,6 +159,61 @@ class Cusparse_Context:
             cls._instance.initialize()
         return cls._instance
 
+dtype2bytes = {}
+dtype2bytes[torch.float32] = 4
+dtype2bytes[torch.float16] = 2
+dtype2bytes[torch.bfloat16] = 2
+dtype2bytes[torch.uint8] = 1
+dtype2bytes[torch.int8] = 1
+
+def get_paged(*shape, dtype=torch.float32, device=torch.device('cuda', index=0)):
+    num_bytes = dtype2bytes[dtype]*prod(shape)
+    cuda_ptr = lib.cget_managed_ptr(ct.c_size_t(num_bytes))
+    c_ptr = ct.cast(cuda_ptr, ct.POINTER(ct.c_int))
+    new_array = np.ctypeslib.as_array(c_ptr, shape=shape)
+    out = torch.frombuffer(new_array, dtype=dtype, count=prod(shape)).view(shape)
+    out.is_paged = True
+    out.page_deviceid = device.index
+    return out
+
+def prefetch_tensor(A, to_cpu=False):
+    assert A.is_paged, 'Only paged tensors can be prefetched!'
+    if to_cpu:
+        deviceid = -1
+    else:
+        deviceid = A.page_deviceid
+
+    num_bytes = dtype2bytes[A.dtype]*A.numel()
+    lib.cprefetch(get_ptr(A), ct.c_size_t(num_bytes), ct.c_int32(deviceid))
+
+def elementwise_func(func_name, A, B, value, prefetch=True):
+    func = None
+    if A.dtype == torch.float32:
+        func = getattr(lib, f'c{func_name}_fp32', None)
+        cvalue = ct.c_float(value)
+    elif A.dtype == torch.uint8:
+        func = getattr(lib, f'c{func_name}_uint8', None)
+        cvalue = ct.c_uint8(value)
+
+    if func is None: raise NotImplementedError(f'Function not implemented: {func_name}')
+
+    is_managed = getattr(A, 'is_managed', False)
+    if is_managed and prefetch:
+        prefetch_tensor(A)
+        if B is not None: prefetch_tensor(B)
+
+    func(get_ptr(A), get_ptr(B), cvalue, ct.c_int64(A.numel()))
+    if A.is_paged or B.is_paged:
+        # paged function are fully asynchronous
+        # if we return from this function, we want to the tensor
+        # to be in the correct state, that is the final state after the
+        # operation occured. So we synchronize.
+        torch.cuda.synchronize()
+
+def fill(A, value, device=None, prefetch=True): elementwise_func('fill', A, None, value)
+def arange(A, device=None): elementwise_func('arange', A, None, 0)
+def _mul(A, B, device=None): elementwise_func('_mul', A, B, 0)
+
 
 def create_linear_map(signed=True, total_bits=8, add_zero=True):
     sign = (-1.0 if signed else 0.0)
@@ -149,9 +231,29 @@ def create_linear_map(signed=True, total_bits=8, add_zero=True):
         return values
     else:
         l = values.numel()//2
-        #return torch.Tensor(values[:l].tolist() + [-1e-6]*((gap//2)-1) + [0]*2 + [1e-6]*((gap//2)-1) + values[l:].tolist())
         return torch.Tensor(values[:l].tolist() + [0]*gap + values[l:].tolist())
 
+def create_normal_map(offset=0.9677083, use_extra_value=True):
+
+    if use_extra_value:
+        # one more positive value, this is an asymmetric type
+        v1 = norm.ppf(torch.linspace(offset, 0.5, 9)[:-1]).tolist()
+        v2 = [0]*(256-15) ## we have 15 non-zero values in this data type
+        v3 = (-norm.ppf(torch.linspace(offset, 0.5, 8)[:-1])).tolist()
+    else:
+        v1 = norm.ppf(torch.linspace(offset, 0.5, 8)[:-1]).tolist()
+        v2 = [0]*(256-14) ## we have 14 non-zero values in this data type
+        v3 = (-norm.ppf(torch.linspace(offset, 0.5, 8)[:-1])).tolist()
+
+    v = v1 + v2 + v3
+
+    values = torch.Tensor(v)
+    values = values.sort().values
+    values /= values.max()
+
+    assert values.numel() == 256
+
+    return values
 
 def create_fp8_map(signed=True, exponent_bits=5, precision_bits=2, total_bits=8):
     e = exponent_bits
@@ -168,7 +270,7 @@ def create_fp8_map(signed=True, exponent_bits=5, precision_bits=2, total_bits=8)
     values = []
     lst = list(itertools.product([0, 1], repeat=precision_bits))
     #for ev in evalues:
-    bias = 2**(exponent_bits-1)-1
+    bias = 2**(exponent_bits-1)
     for evalue in range(2**(exponent_bits)):
         for bit_pattern in lst:
             value = (1 if evalue != 0 else 0)
@@ -176,10 +278,10 @@ def create_fp8_map(signed=True, exponent_bits=5, precision_bits=2, total_bits=8)
                 value += pval*(2**-(i+1))
             if evalue == 0:
                 # subnormals
-                value = value*2**-(bias-1)
+                value = value*2**-(bias)
             else:
                 # normals
-                value = value*2**-(evalue-bias-2)
+                value = value*2**-(evalue-bias-1)
             values.append(value)
             if signed:
                 values.append(-value)
@@ -277,9 +379,17 @@ def get_special_format_str():
 
 def is_on_gpu(tensors):
     on_gpu = True
+    gpu_ids = set()
     for t in tensors:
         if t is None: continue # NULL pointers are fine
-        on_gpu &= t.device.type == 'cuda'
+        is_paged = getattr(t, 'is_paged', False)
+        on_gpu &= (t.device.type == 'cuda' or is_paged)
+        if not is_paged:
+            gpu_ids.add(t.device.index)
+    if not on_gpu:
+        raise TypeError(f'All input tensors need to be on the same GPU, but found some tensors to not be on a GPU:\n {[(t.shape, t.device) for t in tensors]}')
+    if len(gpu_ids) > 1:
+        raise TypeError(f'Input tensors need to be on the same GPU, but found the following tensor and device combinations:\n {[(t.shape, t.device) for t in tensors]}')
     return on_gpu
 
 def get_ptr(A: Tensor) -> ct.c_void_p:
@@ -457,7 +567,7 @@ def estimate_quantiles(A: Tensor, out: Tensor = None, offset: float = 1 / 512, n
     return out
 
 
-def quantize_blockwise(A: Tensor, code: Tensor = None, absmax: Tensor = None, rand=None, out: Tensor = None, blocksize=4096) -> Tensor:
+def quantize_blockwise(A: Tensor, code: Tensor = None, absmax: Tensor = None, out: Tensor = None, blocksize=4096, nested=False) -> Tensor:
     """
     Quantize tensor A in blocks of size 4096 values.
 
@@ -473,8 +583,6 @@ def quantize_blockwise(A: Tensor, code: Tensor = None, absmax: Tensor = None, ra
         The quantization map.
     absmax : torch.Tensor
         The absmax values.
-    rand : torch.Tensor
-        The tensor for stochastic rounding.
     out : torch.Tensor
         The output tensor (8-bit).
 
@@ -496,7 +604,7 @@ def quantize_blockwise(A: Tensor, code: Tensor = None, absmax: Tensor = None, ra
         n = A.numel()
         blocks = n // blocksize
         blocks += 1 if n % blocksize > 0 else 0
-        absmax = torch.zeros((blocks,), device=A.device)
+        absmax = torch.zeros((blocks,), device=A.device, dtype=torch.float32)
 
     if out is None:
         out = torch.zeros_like(A, dtype=torch.uint8)
@@ -506,33 +614,30 @@ def quantize_blockwise(A: Tensor, code: Tensor = None, absmax: Tensor = None, ra
         cblocksize = ct.c_int32(blocksize)
         prev_device = pre_call(A.device)
         code = code.to(A.device)
-        if rand is not None:
-            is_on_gpu([code, A, out, absmax, rand])
-            assert blocksize==4096
-            assert rand.numel() >= 1024
-            rand_offset = random.randint(0, 1023)
-            if A.dtype == torch.float32:
-                lib.cquantize_blockwise_stochastic_fp32(get_ptr(code), get_ptr(A),get_ptr(absmax), get_ptr(out), get_ptr(rand), ct.c_int32(rand_offset), ct.c_int(A.numel()))
-            elif A.dtype == torch.float16:
-                lib.cquantize_blockwise_stochastic_fp16(get_ptr(code), get_ptr(A),get_ptr(absmax), get_ptr(out), get_ptr(rand), ct.c_int32(rand_offset), ct.c_int(A.numel()))
-            else:
-                raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
+        is_on_gpu([code, A, out, absmax])
+        if A.dtype == torch.float32:
+            lib.cquantize_blockwise_fp32(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), cblocksize, ct.c_int(A.numel()))
+        elif A.dtype == torch.float16:
+            lib.cquantize_blockwise_fp16(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), cblocksize, ct.c_int(A.numel()))
+        elif A.dtype == torch.bfloat16:
+            lib.cquantize_blockwise_bf16(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), cblocksize, ct.c_int(A.numel()))
         else:
-            is_on_gpu([code, A, out, absmax])
-            if A.dtype == torch.float32:
-                lib.cquantize_blockwise_fp32(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), cblocksize, ct.c_int(A.numel()))
-            elif A.dtype == torch.float16:
-                lib.cquantize_blockwise_fp16(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), cblocksize, ct.c_int(A.numel()))
-            else:
-                raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
+            raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
         post_call(A.device)
     else:
         # cpu
         code = code.cpu()
-        assert rand is None
         lib.cquantize_blockwise_cpu_fp32(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_longlong(blocksize), ct.c_longlong(A.numel()))
 
-    return out, (absmax, code)
+    if nested:
+        offset = absmax.mean()
+        absmax -= offset
+        qabsmax, state2 = quantize_blockwise(absmax, blocksize=blocksize, nested=False)
+        state = [qabsmax, code, blocksize, nested, A.dtype, offset, state2]
+    else:
+        state = [absmax, code, blocksize, nested, A.dtype, None, None]
+
+    return out, state
 
 
 def dequantize_blockwise(
@@ -542,6 +647,7 @@ def dequantize_blockwise(
     code: Tensor = None,
     out: Tensor = None,
     blocksize: int = 4096,
+    nested=False
 ) -> Tensor:
     """
     Dequantizes blockwise quantized values.
@@ -574,24 +680,31 @@ def dequantize_blockwise(
             name2qmap["dynamic"] = create_dynamic_map().to(A.device)
         code = name2qmap["dynamic"]
 
-    if out is None:
-        out = torch.zeros_like(A, dtype=torch.float32)
     if quant_state is None:
-        quant_state = (absmax, code)
-    else:
-        absmax, code = quant_state
+       quant_state = (absmax, code, blocksize, False, torch.float32, None, None)
 
+    absmax, code, blocksize, nested, dtype, offset, state2 = quant_state
+
+    if nested:
+        absmax = dequantize_blockwise(absmax, state2)
+        absmax += offset
+        if absmax.dtype != torch.float32: absmax = absmax.float()
+
+    if out is None:
+        out = torch.empty(A.shape, dtype=dtype, device=A.device)
 
     if A.device.type != 'cpu':
         device = pre_call(A.device)
         code = code.to(A.device)
         if blocksize not in [2048, 4096, 1024, 512, 256, 128, 64]:
             raise ValueError(f"The blockwise of {blocksize} is not supported. Supported values: [2048, 4096, 1024, 512, 256, 128, 64]")
-        is_on_gpu([A, out])
+        is_on_gpu([A, absmax, out])
         if out.dtype == torch.float32:
             lib.cdequantize_blockwise_fp32(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(A.numel()))
         elif out.dtype == torch.float16:
             lib.cdequantize_blockwise_fp16(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(A.numel()))
+        elif out.dtype == torch.bfloat16:
+            lib.cdequantize_blockwise_bf16(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(A.numel()))
         else:
             raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
         post_call(A.device)
@@ -600,6 +713,227 @@ def dequantize_blockwise(
         lib.cdequantize_blockwise_cpu_fp32(get_ptr(quant_state[1]), get_ptr(A), get_ptr(quant_state[0]), get_ptr(out), ct.c_longlong(blocksize), ct.c_longlong(A.numel()))
 
     return out
+
+def get_4bit_type(typename, device=None, blocksize=64):
+    if device is None: device = 'cuda'
+    data = None
+    if typename == 'nf4':
+        ''' Implements the NF4 data type.
+
+            Constructs a quantization data type where each bin has equal area under a standard normal distribution N(0, 1) that
+            is normalized into the range [-1, 1].
+
+            For more information read the paper: QLoRA: Efficient Finetuning of Quantized LLMs (https://arxiv.org/abs/2305.14314)
+
+            Implementation of the NF4 data type in bitsandbytes can be found in the `create_normal_map` function in
+            the `functional.py` file: https://github.com/TimDettmers/bitsandbytes/blob/main/bitsandbytes/functional.py#L236.
+        '''
+        data = [-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635,
+                -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725,
+                0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+                0.7229568362236023, 1.0]
+    elif typename == 'fp4':
+        # 0b000 = 0
+        # 0b001 = 0.0625
+        # 0b010 = 8
+        # 0b011 = 12
+        # 0b100 = 4
+        # 0b101 = 6
+        # 0b110 = 2
+        # 0b111 = 3
+        # can also be created with bnb.functional.create_fp8_map(signed=True, exponent_bits=2, precision_bits=1, total_bits=4)
+        data = [0, 0.0625, 8.0, 12.0, 4.0, 6.0, 2.0, 3.0, -0, -0.0625, -8.0, -12.0, -4.0, -6.0, -2.0, -3.0]
+    elif typename == 'int4':
+        data = [7, 6, 5, 4, 3, 2, 1, 0, -0, -1, -2, -3, -4, -5, -6, -7]
+    elif typename == 'af4':
+        # Taken from: NF4 Isn't Information Theoretically Optimal (and that's Good)
+        # https://arxiv.org/abs/2306.06965
+        if blocksize == 64:
+            data = [-1., -0.69441008, -0.51243739, -0.3736951, -0.25607552, -0.14982478,
+                    -0.04934812,  0., 0.04273164, 0.12934483, 0.21961274, 0.31675666,
+                    0.42563882,  0.55496234,  0.72424863,  1.][::-1]
+        else:
+            raise NotImplementedError(f'4-bit AbnormalFloats currently only support blocksize 64.')
+
+    if data is None:
+        raise NotImplementedError(f'Typename {typename} not supported')
+
+    data = Tensor(data)
+    data /= data.abs().max()
+    assert data.numel() == 16
+
+    return data.to(device)
+
+
+
+def quantize_fp4(A: Tensor, absmax: Tensor = None, out: Tensor = None, blocksize=64, compress_statistics=False):
+    return quantize_4bit(A, absmax, out, blocksize, compress_statistics, 'fp4')
+
+def quantize_nf4(A: Tensor, absmax: Tensor = None, out: Tensor = None, blocksize=64, compress_statistics=False):
+    return quantize_4bit(A, absmax, out, blocksize, compress_statistics, 'nf4')
+
+def quantize_4bit(A: Tensor, absmax: Tensor = None, out: Tensor = None, blocksize=64, compress_statistics=False, quant_type='fp4') -> Tensor:
+    """
+    Quantize tensor A in blocks of 4-bit values.
+
+    Quantizes tensor A by dividing it into blocks which are independently quantized to FP4.
+
+    Parameters
+    ----------
+    A : torch.Tensor
+        The input tensor.
+    absmax : torch.Tensor
+        The absmax values.
+    out : torch.Tensor
+        The output tensor (8-bit).
+    blocksize : int
+        The blocksize used in quantization.
+    quant_type : str
+        The 4-bit quantization data type {fp4, nf4}
+
+    Returns
+    -------
+    torch.Tensor:
+        The 8-bit tensor with packed 4-bit values.
+    tuple(torch.Tensor, torch.Size, torch.dtype, int):
+        The quantization state to undo the quantization.
+    """
+    if A.device.type != 'cuda':
+        raise NotImplementedError(f'Device type not supported for FP4 quantization: {A.device.type}')
+    if quant_type not in ['fp4', 'nf4']:
+        raise NotImplementedError(f'4-bit quantization data type {quant_type} is not implemented.')
+
+    n = A.numel()
+    input_shape = A.shape
+
+    if absmax is None:
+        blocks = n // blocksize
+        blocks += 1 if n % blocksize > 0 else 0
+        absmax = torch.zeros((blocks,), device=A.device, dtype=torch.float32)
+
+
+    if out is None:
+        out = torch.zeros(((n+1)//2, 1), dtype=torch.uint8, device=A.device)
+
+    assert blocksize in [4096, 2048, 1024, 512, 256, 128, 64]
+
+    prev_device = pre_call(A.device)
+    is_on_gpu([A, out, absmax])
+
+    if A.dtype == torch.float32:
+        if quant_type == 'fp4':
+            lib.cquantize_blockwise_fp32_fp4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int32(blocksize), ct.c_int(n))
+        else:
+            lib.cquantize_blockwise_fp32_nf4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int32(blocksize), ct.c_int(n))
+    elif A.dtype == torch.float16:
+        if quant_type == 'fp4':
+            lib.cquantize_blockwise_fp16_fp4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int32(blocksize), ct.c_int(n))
+        else:
+            lib.cquantize_blockwise_fp16_nf4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int32(blocksize), ct.c_int(n))
+    elif A.dtype == torch.bfloat16:
+        if quant_type == 'fp4':
+            lib.cquantize_blockwise_bf16_fp4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int32(blocksize), ct.c_int(n))
+        else:
+            lib.cquantize_blockwise_bf16_nf4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int32(blocksize), ct.c_int(n))
+    else:
+        raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
+    post_call(A.device)
+
+    datatype = get_4bit_type(quant_type, device=A.device)
+
+    if compress_statistics:
+        offset = absmax.mean()
+        absmax -= offset
+        qabsmax, state2 = quantize_blockwise(absmax, blocksize=256)
+        del absmax
+        state = [qabsmax, input_shape, A.dtype, blocksize, [offset, state2], quant_type, datatype]
+    else:
+        state = [absmax, input_shape, A.dtype, blocksize, None, quant_type, datatype]
+
+    return out, state
+
+def dequantize_fp4(A: Tensor, quant_state: Tuple[Tensor, Tensor] = None, absmax: Tensor = None, out: Tensor = None, blocksize: int = 64) -> Tensor:
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, 'fp4')
+
+def dequantize_nf4(A: Tensor, quant_state: Tuple[Tensor, Tensor] = None, absmax: Tensor = None, out: Tensor = None, blocksize: int = 64) -> Tensor:
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, 'nf4')
+
+def dequantize_4bit(A: Tensor,quant_state: Tuple[Tensor, Tensor] = None, absmax: Tensor = None, out: Tensor = None, blocksize: int = 64, quant_type='fp4') -> Tensor:
+    """
+    Dequantizes FP4 blockwise quantized values.
+
+    Dequantizes the tensor A with maximum absolute values absmax in blocks of size blocksize.
+
+    Parameters
+    ----------
+    A : torch.Tensor
+        The input 8-bit tensor (packed 4-bit values).
+    quant_state : tuple(torch.Tensor, torch.Size, torch.dtype)
+        Tuple of absmax values, original tensor shape and original dtype.
+    absmax : torch.Tensor
+        The absmax values.
+    out : torch.Tensor
+        Dequantized output tensor.
+    blocksize : int
+        The blocksize used in quantization.
+    quant_type : str
+        The 4-bit quantization data type {fp4, nf4}
+
+
+    Returns
+    -------
+    torch.Tensor:
+        Dequantized tensor.
+    """
+    if blocksize not in [2048, 4096, 1024, 512, 256, 128, 64]:
+        raise ValueError(f"The blockwise of {blocksize} is not supported. Supported values: [2048, 4096, 1024, 512, 256, 128, 64]")
+    if quant_type not in ['fp4', 'nf4']:
+        raise NotImplementedError(f'4-bit quantization data type {quant_type} is not implemented.')
+
+    if quant_state is None:
+        assert absmax is not None and out is not None
+        shape = out.shape
+        dtype = out.dtype
+    else:
+        absmax, shape, dtype, blocksize, compressed_stats, quant_type, data_type = quant_state
+
+
+    if compressed_stats is not None:
+        offset, state2 = compressed_stats
+        absmax = dequantize_blockwise(absmax, state2)
+        absmax += offset
+        if absmax.dtype != torch.float32: absmax = absmax.float()
+
+    if out is None:
+        out = torch.empty(shape, dtype=dtype, device=A.device)
+
+    n = out.numel()
+
+
+    device = pre_call(A.device)
+    is_on_gpu([A, absmax, out])
+    if out.dtype == torch.float32:
+        if quant_type == 'fp4':
+            lib.cdequantize_blockwise_fp32_fp4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(n))
+        else:
+            lib.cdequantize_blockwise_fp32_nf4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(n))
+    elif out.dtype == torch.float16:
+        if quant_type == 'fp4':
+            lib.cdequantize_blockwise_fp16_fp4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(n))
+        else:
+            lib.cdequantize_blockwise_fp16_nf4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(n))
+    elif out.dtype == torch.bfloat16:
+        if quant_type == 'fp4':
+            lib.cdequantize_blockwise_bf16_fp4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(n))
+        else:
+            lib.cdequantize_blockwise_bf16_nf4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(n))
+    else:
+        raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
+    post_call(A.device)
+
+    is_transposed = (True if A.shape[0] == 1 else False)
+    if is_transposed: return out.t()
+    else: return out
 
 
 def quantize(A: Tensor, code: Tensor = None, out: Tensor = None) -> Tensor:
@@ -610,6 +944,7 @@ def quantize(A: Tensor, code: Tensor = None, out: Tensor = None) -> Tensor:
         code = code.to(A.device)
 
     absmax = torch.abs(A).max()
+    if absmax.dtype != torch.float32: absmax = absmax.float()
     inp = A / absmax
     out = quantize_no_absmax(inp, code, out)
     return out, (absmax, code)
@@ -656,9 +991,11 @@ def quantize_no_absmax(A: Tensor, code: Tensor, out: Tensor = None) -> Tensor:
     torch.Tensor:
         Quantized 8-bit tensor.
     '''
+    prev_device = pre_call(A.device)
     if out is None: out = torch.zeros_like(A, dtype=torch.uint8)
     is_on_gpu([A, out])
     lib.cquantize(get_ptr(code), get_ptr(A), get_ptr(out), ct.c_int(A.numel()))
+    post_call(prev_device)
     return out
 
 
@@ -683,9 +1020,11 @@ def dequantize_no_absmax(A: Tensor, code: Tensor, out: Tensor = None) -> Tensor:
     torch.Tensor:
         32-bit output tensor.
     '''
+    prev_device = pre_call(A.device)
     if out is None: out = torch.zeros_like(A, dtype=torch.float32)
     is_on_gpu([code, A, out])
     lib.cdequantize(get_ptr(code), get_ptr(A), get_ptr(out), ct.c_int(A.numel()))
+    post_call(prev_device)
     return out
 
 
@@ -749,53 +1088,37 @@ def optimizer_update_32bit(
     if max_unorm > 0.0:
         param_norm = torch.norm(p.data.float())
 
-    if optimizer_name not in str2optimizer32bit:
-        raise NotImplementedError(
-            f'Optimizer not implemented: {optimizer_name}. Choices: {",".join(str2optimizer32bit.keys())}'
-        )
 
-    if g.dtype == torch.float32 and state1.dtype == torch.float32:
-        str2optimizer32bit[optimizer_name][0](
-            get_ptr(g),
-            get_ptr(p),
-            get_ptr(state1),
-            get_ptr(state2),
-            get_ptr(unorm_vec),
-            ct.c_float(max_unorm),
-            ct.c_float(param_norm),
-            ct.c_float(beta1),
-            ct.c_float(beta2),
-            ct.c_float(eps),
-            ct.c_float(weight_decay),
-            ct.c_int32(step),
-            ct.c_float(lr),
-            ct.c_float(gnorm_scale),
-            ct.c_bool(skip_zeros),
-            ct.c_int32(g.numel()),
-        )
-    elif g.dtype == torch.float16 and state1.dtype == torch.float32:
-        str2optimizer32bit[optimizer_name][1](
-            get_ptr(g),
-            get_ptr(p),
-            get_ptr(state1),
-            get_ptr(state2),
-            get_ptr(unorm_vec),
-            ct.c_float(max_unorm),
-            ct.c_float(param_norm),
-            ct.c_float(beta1),
-            ct.c_float(beta2),
-            ct.c_float(eps),
-            ct.c_float(weight_decay),
-            ct.c_int32(step),
-            ct.c_float(lr),
-            ct.c_float(gnorm_scale),
-            ct.c_bool(skip_zeros),
-            ct.c_int32(g.numel()),
-        )
+    optim_func = None
+    if g.dtype == torch.float32:
+        optim_func = str2optimizer32bit[optimizer_name][0]
+    elif g.dtype == torch.float16:
+        optim_func = str2optimizer32bit[optimizer_name][1]
+    elif (g.dtype == torch.bfloat16 and len(str2optimizer32bit[optimizer_name])==3):
+        optim_func = str2optimizer32bit[optimizer_name][2]
     else:
-        raise ValueError(
-            f"Gradient+optimizer bit data type combination not supported: grad {g.dtype}, optimizer {state1.dtype}"
-        )
+        raise ValueError(f"Gradient+optimizer bit data type combination not supported: grad {g.dtype}, optimizer {state1.dtype}")
+
+    is_on_gpu([g, p, state1, state2, unorm_vec])
+    prev_device = pre_call(g.device)
+    optim_func(
+        get_ptr(g),
+        get_ptr(p),
+        get_ptr(state1),
+        get_ptr(state2),
+        get_ptr(unorm_vec),
+        ct.c_float(max_unorm),
+        ct.c_float(param_norm),
+        ct.c_float(beta1),
+        ct.c_float(beta2),
+        ct.c_float(eps),
+        ct.c_float(weight_decay),
+        ct.c_int32(step),
+        ct.c_float(lr),
+        ct.c_float(gnorm_scale),
+        ct.c_bool(skip_zeros),
+        ct.c_int32(g.numel()))
+    post_call(prev_device)
 
 
 def optimizer_update_8bit(
@@ -874,6 +1197,8 @@ def optimizer_update_8bit(
     if max_unorm > 0.0:
         param_norm = torch.norm(p.data.float())
 
+    prev_device = pre_call(g.device)
+    is_on_gpu([g, p, state1, state2, unorm_vec, qmap1, qmap2, max1, max2, new_max1, new_max2])
     if g.dtype == torch.float32 and state1.dtype == torch.uint8:
         str2optimizer8bit[optimizer_name][0](
             get_ptr(p),
@@ -926,6 +1251,7 @@ def optimizer_update_8bit(
         raise ValueError(
             f"Gradient+optimizer bit data type combination not supported: grad {g.dtype}, optimizer {state1.dtype}"
         )
+    post_call(prev_device)
 
 
 def optimizer_update_8bit_blockwise(
@@ -948,51 +1274,45 @@ def optimizer_update_8bit_blockwise(
     skip_zeros=False,
 ) -> None:
 
+    optim_func = None
+    prev_device = pre_call(g.device)
+    is_on_gpu([g, p, state1, state2, qmap1, qmap2, absmax1, absmax2])
     if g.dtype == torch.float32 and state1.dtype == torch.uint8:
-        str2optimizer8bit_blockwise[optimizer_name][0](
-            get_ptr(p),
-            get_ptr(g),
-            get_ptr(state1),
-            get_ptr(state2),
-            ct.c_float(beta1),
-            ct.c_float(beta2),
-            ct.c_float(eps),
-            ct.c_int32(step),
-            ct.c_float(lr),
-            get_ptr(qmap1),
-            get_ptr(qmap2),
-            get_ptr(absmax1),
-            get_ptr(absmax2),
-            ct.c_float(weight_decay),
-            ct.c_float(gnorm_scale),
-            ct.c_bool(skip_zeros),
-            ct.c_int32(g.numel()),
-        )
+        optim_func = str2optimizer8bit_blockwise[optimizer_name][0]
     elif g.dtype == torch.float16 and state1.dtype == torch.uint8:
-        str2optimizer8bit_blockwise[optimizer_name][1](
-            get_ptr(p),
-            get_ptr(g),
-            get_ptr(state1),
-            get_ptr(state2),
-            ct.c_float(beta1),
-            ct.c_float(beta2),
-            ct.c_float(eps),
-            ct.c_int32(step),
-            ct.c_float(lr),
-            get_ptr(qmap1),
-            get_ptr(qmap2),
-            get_ptr(absmax1),
-            get_ptr(absmax2),
-            ct.c_float(weight_decay),
-            ct.c_float(gnorm_scale),
-            ct.c_bool(skip_zeros),
-            ct.c_int32(g.numel()),
-        )
+        optim_func = str2optimizer8bit_blockwise[optimizer_name][1]
+    elif (g.dtype == torch.bfloat16 and state1.dtype == torch.uint8 and
+          len(str2optimizer8bit_blockwise[optimizer_name])==3):
+        optim_func = str2optimizer8bit_blockwise[optimizer_name][2]
     else:
         raise ValueError(
             f"Gradient+optimizer bit data type combination not supported: grad {g.dtype}, optimizer {state1.dtype}"
         )
+    post_call(prev_device)
 
+    is_on_gpu([p, g, state1, state2, qmap1, qmap2, absmax1, absmax2])
+
+    prev_device = pre_call(g.device)
+    optim_func(
+        get_ptr(p),
+        get_ptr(g),
+        get_ptr(state1),
+        get_ptr(state2),
+        ct.c_float(beta1),
+        ct.c_float(beta2),
+        ct.c_float(eps),
+        ct.c_int32(step),
+        ct.c_float(lr),
+        get_ptr(qmap1),
+        get_ptr(qmap2),
+        get_ptr(absmax1),
+        get_ptr(absmax2),
+        ct.c_float(weight_decay),
+        ct.c_float(gnorm_scale),
+        ct.c_bool(skip_zeros),
+        ct.c_int32(g.numel()),
+    )
+    post_call(prev_device)
 
 def percentile_clipping(
     grad: Tensor, gnorm_vec: Tensor, step: int, percentile: int = 5
@@ -1007,6 +1327,7 @@ def percentile_clipping(
         The current optimiation steps (number of past gradient norms).
 
     """
+    prev_device = pre_call(grad.device)
     is_on_gpu([grad, gnorm_vec])
     if grad.dtype == torch.float32:
         lib.cpercentile_clipping_g32(
@@ -1024,6 +1345,7 @@ def percentile_clipping(
         )
     else:
         raise ValueError(f"Gradient type {grad.dtype} not supported!")
+    post_call(prev_device)
 
     current_gnorm = torch.sqrt(gnorm_vec[step % 100])
     vals, idx = torch.sort(gnorm_vec)
@@ -1144,6 +1466,66 @@ def check_matmul(A, B, out, transposed_A, transposed_B, expected_type=torch.int8
 
     return sout
 
+def gemv_4bit(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor = None,
+    transposed_A=False,
+    transposed_B=False,
+    state=None
+):
+    prev_device = pre_call(A.device)
+    #sout = check_matmul(A, B, out, transposed_A, transposed_B, expected_type=A.dtype)
+    if state is None:
+        raise ValueError(f'state cannot None. gem_4bit( ) requires the state from quantize_4bit( )')
+
+    if A.numel() != A.shape[-1]:
+        raise ValueError(f'Dimensions of A are invalid. Must be a vector with the leading dimensions of "1", e.g. [1, 1, 2048]')
+
+    Bshape = state[1]
+    bout = Bshape[0]
+    absmax, shape, dtype, blocksize, compressed_stats, quant_type, data_type = state
+    if compressed_stats is not None:
+        offset, state2 = compressed_stats
+        absmax = dequantize_blockwise(absmax, state2)
+        absmax += offset
+
+    if out is None:
+        if len(A.shape) == 3:
+            out = torch.empty(size=(A.shape[0], A.shape[1], bout), dtype=A.dtype, device=A.device)
+        else:
+            out = torch.empty(size=(A.shape[0], bout), dtype=A.dtype, device=A.device)
+
+    n = 1
+    m = Bshape[0]
+    k = Bshape[1]
+    lda = Bshape[0]
+    ldc = Bshape[0]
+    ldb = (A.shape[-1]+1)//2
+    is_on_gpu([B, A, out, absmax, state[-1]])
+    m = ct.c_int32(m)
+    n = ct.c_int32(n)
+    k = ct.c_int32(k)
+    lda = ct.c_int32(lda)
+    ldb = ct.c_int32(ldb)
+    ldc = ct.c_int32(ldc)
+
+    if B.dtype == torch.uint8:
+        if A.dtype == torch.float16:
+            lib.cgemm_4bit_inference_naive_fp16(m, n, k, get_ptr(A), get_ptr(B), get_ptr(absmax), get_ptr(state[-1]), get_ptr(out), lda, ldb, ldc, ct.c_int32(state[3]))
+        elif A.dtype == torch.bfloat16:
+            lib.cgemm_4bit_inference_naive_bf16(m, n, k, get_ptr(A), get_ptr(B), get_ptr(absmax), get_ptr(state[-1]), get_ptr(out), lda, ldb, ldc, ct.c_int32(state[3]))
+        elif A.dtype == torch.float32:
+            lib.cgemm_4bit_inference_naive_fp32(m, n, k, get_ptr(A), get_ptr(B), get_ptr(absmax), get_ptr(state[-1]), get_ptr(out), lda, ldb, ldc, ct.c_int32(state[3]))
+        else:
+            raise NotImplementedError(f'Matmul not implemented for data type {A.dtype}')
+
+    else:
+        raise NotImplementedError(f'Matmul not implemented for data type {A.dtype}')
+
+    post_call(prev_device)
+
+    return out
 
 def igemm(
     A: Tensor,
@@ -1780,6 +2162,7 @@ def spmm_coo_very_sparse(cooA, B, dequant_stats=None, out=None):
             (cooA.rows, B.shape[1]), device=B.device, dtype=cooA.values.dtype
         )
     nnz = cooA.nnz
+    prev_device = pre_call(B.device)
     assert cooA.rowidx.numel() == nnz
     assert cooA.colidx.numel() == nnz
     assert cooA.values.numel() == nnz
@@ -1817,8 +2200,6 @@ def spmm_coo_very_sparse(cooA, B, dequant_stats=None, out=None):
     ccolsB = ct.c_int32(B.shape[1])
     cldb = ct.c_int32(ldb)
     cldc = ct.c_int32(ldc)
-    # print(cooA.rowidx[:64])
-    # print(cooA.colidx[:64].sort()[0])
 
     is_on_gpu([cooA.rowidx, cooA.colidx, cooA.values, B, out, dequant_stats])
     if B.dtype == torch.float16:
@@ -1856,6 +2237,7 @@ def spmm_coo_very_sparse(cooA, B, dequant_stats=None, out=None):
             ccolsB,
         )
     # else: assertion error
+    post_call(prev_device)
 
     return out
 
@@ -2014,4 +2396,9 @@ def extract_outliers(A, SA, idx):
         lib.cextractOutliers_ampere(ptrA, ptrIdx, ptrOut, idx_size, rows, cols)
     post_call(prev_device)
 
+    return out
+
+def pipeline_test(A, batch_size):
+    out = torch.zeros_like(A)
+    lib.cpipeline_test(get_ptr(A), get_ptr(out), ct.c_size_t(A.numel()), ct.c_size_t(batch_size))
     return out
